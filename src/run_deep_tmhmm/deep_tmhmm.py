@@ -113,7 +113,7 @@ def run_gpu_worker(batch, gpu, data_path, torch_path, dt_path, log):
                 SeqIO.write(record, file, "fasta")
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ''
         env["TORCH_HOME"] = str(torch_path)
         cmd = [ "python", "predict.py", "--fasta", fasta_path.name, "--output-dir", output_path.name ]
         subprocess.run(cmd, env = env, check = True, cwd = tmp_path, stdout = log, stderr = log)
@@ -181,13 +181,14 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
         gpu_queue.put(gpu)
 
     def wrapper(batch, log):
-        gpu = gpu_queue.get()
+        gpu = gpu_queue.get() if gpus else None
         try:
             return run_gpu_worker(batch, gpu, data_path, torch_path, dt_path, log)
         except Exception as e:
             print(f"[✘] Error: Got exception: {e}")
         finally:
-            gpu_queue.put(gpu)
+            if gpus:
+                gpu_queue.put(gpu)
 
     def check_futures(futures, conn, all_results, progress_bar, max_num = 1):
         assert max_num > 0
@@ -203,11 +204,11 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
         all_results.update(results)
         return futures
 
-    num_gpus = len(gpus)
-    with get_log(log_file) as log, TPE(max_workers = num_gpus) as executor, sqlite3.connect(db_path) as conn, tqdm(total = len(to_analyze)) as progress_bar:
+    num_workers = len(gpus) if gpus else 1
+    with get_log(log_file) as log, TPE(max_workers = num_workers) as executor, sqlite3.connect(db_path) as conn, tqdm(total = len(to_analyze)) as progress_bar:
         futures = set()
         for to_predict in process_fasta():
-            futures = check_futures(futures, conn, results, progress_bar, num_gpus)
+            futures = check_futures(futures, conn, results, progress_bar, num_workers)
             futures.add(executor.submit(wrapper, to_predict.values(), log))
         check_futures(futures, conn, results, progress_bar)
 
@@ -236,7 +237,7 @@ def init_cli():
 def run_cli():
     parser = argparse.ArgumentParser(description = "DeepTMHMM wrapper: run the inference")
     def set_of_int(arg):
-        return set(int(x) for x in arg.split(','))
+        return set(int(x) for x in arg.split(',')) if arg != '' else []
 
     BATCH_SIZE = 100
 
@@ -245,7 +246,7 @@ def run_cli():
     parser.add_argument("-o", "--output", required = True, help = "Output file")
     parser.add_argument("-E", "--deep-tmhmm", required = True, help = "DeepTMHMM executable directory (from https://dtu.biolib.com/DeepTMHMM)")
     parser.add_argument("-b", "--batch", type = int, default = BATCH_SIZE, help = f"Batch size (default: {BATCH_SIZE})")
-    parser.add_argument("-g", "--gpus", type = set_of_int, default = [0], help = "GPU indices to use (default: first)")
+    parser.add_argument("-g", "--gpus", type = set_of_int, default = [0], help = "Comma-separated list of GPU indices or empty for (all) CPUs instead (default: 0 [first GPU])")
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
     args = parser.parse_args()
     launch_run(args.input, args.output, args.batch, args.data_dir, args.deep_tmhmm, args.log, gpus = args.gpus)
