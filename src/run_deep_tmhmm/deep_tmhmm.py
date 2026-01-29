@@ -15,6 +15,7 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor as TPE
 from contextlib import contextmanager
 import subprocess
+import re
 
 # --- Helper Functions ---
 
@@ -36,6 +37,9 @@ def get_hash(seq):
 
 def get_rle(seq):
     return "".join(f"{len(list(group))}{char}" for char, group in itertools.groupby(seq.strip()))
+
+def decode_rle(data):
+    return "".join(int(count) * char for count, char in re.findall(r"(\d+)(.)", data))
 
 def download_file(url, output_path):
     """Downloads a file using urllib.request."""
@@ -91,12 +95,17 @@ def fetch_rle(conn, seq_hash):
 
 # --- Inference Logic ---
 
-def run_gpu_worker(batch, gpu, data_path, torch_path, dt_path, log):
+def run_gpu_worker(batch, gpu, cpus, data_path, torch_path, dt_path, log):
+
+    assert isinstance(cpus, int)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir).resolve()
         fasta_path = tmp_path / "input.fasta"
         output_path = tmp_path / "output"
+
+        customize_path = tmp_path / "sitecustomize.py"
+        customize_path.write_text(f"import os; os.cpu_count = lambda: {cpus}")
 
         for item in dt_path.iterdir():
             if item.name not in [ fasta_path.name, output_path.name ]:
@@ -113,6 +122,10 @@ def run_gpu_worker(batch, gpu, data_path, torch_path, dt_path, log):
                 SeqIO.write(record, file, "fasta")
 
         env = os.environ.copy()
+        pythonpath = [ str(tmp_path) ]
+        if "PYTHONPATH" in env:
+            pythonpath.add(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
         env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ''
         env["TORCH_HOME"] = str(torch_path)
         cmd = [ "python", "predict.py", "--fasta", fasta_path.name, "--output-dir", output_path.name ]
@@ -129,10 +142,27 @@ def run_gpu_worker(batch, gpu, data_path, torch_path, dt_path, log):
                     output.append((seq_hash, seq_name, rle))
         return output
 
-def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, gpus):
+class GPUPool:
+    def __init__(self, gpus, workers):
+        self.assigned_gpus = list(itertools.islice(itertools.cycle(gpus), workers))
+        self._queue = queue.Queue()
+        for gpu in self.assigned_gpus:
+            self._queue.put(gpu)
+    def get(self):
+        return self._queue.get() if self.assigned_gpus else None
+    def put(self, gpu):
+        if gpu is not None:
+            self._queue.put(gpu)
+
+def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, gpus, cpus, workers):
     output_path = Path(output_file).resolve()
     data_path, torch_path, db_path = data_paths(data_dir)
     dt_path = Path(dt_dir)
+
+    if cpus <= 0:
+        raise ValueError(f"Specify a positive number of CPUs")
+    if workers <= 0:
+        raise ValueError(f"Specify a positive number of workers")
 
     if not data_path.exists():
         raise FileNotFoundError(f"[✘] Data directory {data_dir} not found. Run 'init' mode first.")
@@ -175,20 +205,16 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
         if to_predict:
             yield to_predict
 
-    # GPU queue
-    gpu_queue = queue.Queue()
-    for gpu in gpus:
-        gpu_queue.put(gpu)
+    gpu_pool = GPUPool(gpus, workers)
 
     def wrapper(batch, log):
-        gpu = gpu_queue.get() if gpus else None
+        gpu = gpu_pool.get()
         try:
-            return run_gpu_worker(batch, gpu, data_path, torch_path, dt_path, log)
+            return run_gpu_worker(batch, gpu, max(1, cpus // workers), data_path, torch_path, dt_path, log)
         except Exception as e:
             print(f"[✘] Error: Got exception: {e}")
         finally:
-            if gpus:
-                gpu_queue.put(gpu)
+            gpu_pool.put(gpu)
 
     def check_futures(futures, conn, all_results, progress_bar, max_num = 1):
         assert max_num > 0
@@ -204,11 +230,10 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
         all_results.update(results)
         return futures
 
-    num_workers = len(gpus) if gpus else 1
-    with get_log(log_file) as log, TPE(max_workers = num_workers) as executor, sqlite3.connect(db_path) as conn, tqdm(total = len(to_analyze)) as progress_bar:
+    with get_log(log_file) as log, TPE(max_workers = workers) as executor, sqlite3.connect(db_path) as conn, tqdm(total = len(to_analyze)) as progress_bar:
         futures = set()
         for to_predict in process_fasta():
-            futures = check_futures(futures, conn, results, progress_bar, num_workers)
+            futures = check_futures(futures, conn, results, progress_bar, workers)
             futures.add(executor.submit(wrapper, to_predict.values(), log))
         check_futures(futures, conn, results, progress_bar)
 
@@ -216,7 +241,8 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
     with open(output_path, 'w') as file:
         for seq_name in all_names:
             if rle := results.pop(seq_name, None):
-                file.write(f"{seq_name}\t{rle}\n")
+                pred = decode_rle(rle)
+                file.write(f">{seq_name}\n{pred}\n")
             else:
                 print(f"No results obtained for {seq_name}")
                 ok = False
@@ -246,7 +272,9 @@ def run_cli():
     parser.add_argument("-o", "--output", required = True, help = "Output file")
     parser.add_argument("-E", "--deep-tmhmm", required = True, help = "DeepTMHMM executable directory (from https://dtu.biolib.com/DeepTMHMM)")
     parser.add_argument("-b", "--batch", type = int, default = BATCH_SIZE, help = f"Batch size (default: {BATCH_SIZE})")
-    parser.add_argument("-g", "--gpus", type = set_of_int, default = [0], help = "Comma-separated list of GPU indices or empty for (all) CPUs instead (default: 0 [first GPU])")
+    parser.add_argument("-g", "--gpus", type = set_of_int, default = [0], help = "Comma-separated list of indices of available GPUs or empty (default: 0 [first GPU])")
+    parser.add_argument("-c", "--cpus", type = int, default = 1, help = "Total number of CPUs to use (default: 1)")
+    parser.add_argument("-w", "--workers", type = int, default = 1, help = "Total number of parallel workers to spawn (default: 1)")
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
     args = parser.parse_args()
-    launch_run(args.input, args.output, args.batch, args.data_dir, args.deep_tmhmm, args.log, gpus = args.gpus)
+    launch_run(args.input, args.output, args.batch, args.data_dir, args.deep_tmhmm, args.log, gpus = args.gpus, cpus = args.cpus, workers = args.workers)
