@@ -30,9 +30,14 @@ def get_log(log_path):
     finally:
         f.close()
 
-def get_hash(seq):
-    clean_seq = str(seq).upper().strip().replace("*", "")
-    raw_hash = hashlib.sha256(clean_seq.encode('ascii')).digest()
+def clean_seq(seq, keep_case):
+    seq = seq.strip().replace("*", "").replace("-", "").replace(" ", "")
+    if not keep_case:
+        seq = seq.upper()
+    return seq
+
+def get_hash(seq, keep_case):
+    raw_hash = hashlib.sha256(str(seq).encode('ascii')).digest()
     return base64.urlsafe_b64encode(raw_hash).decode().rstrip("=")
 
 def get_rle(seq):
@@ -154,7 +159,7 @@ class GPUPool:
         if gpu is not None:
             self._queue.put(gpu)
 
-def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, gpus, cpus, workers):
+def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, keep_case, gpus, cpus, workers):
     output_path = Path(output_file).resolve()
     data_path, torch_path, db_path = data_paths(data_dir)
     dt_path = Path(dt_dir)
@@ -184,7 +189,8 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
                 print(f"[✘] Duplicated record id {record.id}")
                 sys.exit(1)
             unique.add(record.id)
-            seq_hash = get_hash(record.seq)
+            seq = clean_seq(record.seq, keep_case)
+            seq_hash = get_hash(seq, keep_case)
             rle = fetch_rle(conn, seq_hash)
             if rle:
                 results[record.id] = rle
@@ -198,7 +204,7 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
         for record in SeqIO.parse(input_file, "fasta"):
             seq_hash = to_analyze.pop(record.id, None)
             if seq_hash:
-                record.seq = record.seq.upper().replace('-', '').replace('*', '')
+                record.seq = clean_seq(record.seq, keep_case)
                 to_predict[record.id] = seq_hash, record
                 if len(to_predict) == batch_size:
                     yield to_predict
@@ -276,6 +282,10 @@ def run_cli():
     parser.add_argument("-g", "--gpus", type = set_of_int, default = [0], help = "Comma-separated list of indices of available GPUs or empty (default: 0 [first GPU])")
     parser.add_argument("-c", "--cpus", type = int, default = 1, help = "Total number of CPUs to use (default: 1)")
     parser.add_argument("-w", "--workers", type = int, default = 1, help = "Total number of parallel workers to spawn (default: 1)")
+    parser.add_argument("-k", "--keep-case", action = 'store_true', help = "Do not change the case of the sequences")
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
     args = parser.parse_args()
-    launch_run(args.input, args.output, args.batch, args.data_dir, args.deep_tmhmm, args.log, gpus = args.gpus, cpus = args.cpus, workers = args.workers)
+    launch_run(
+        args.input, args.output, args.batch, args.data_dir, args.deep_tmhmm, args.log,
+        gpus = args.gpus, cpus = args.cpus, workers = args.workers, keep_case = args.keep_case
+    )
