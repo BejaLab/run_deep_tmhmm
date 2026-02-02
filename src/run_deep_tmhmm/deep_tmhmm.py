@@ -198,6 +198,7 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
         for record in SeqIO.parse(input_file, "fasta"):
             seq_hash = to_analyze.pop(record.id, None)
             if seq_hash:
+                record.seq = record.seq.upper().replace('-', '').replace('*', '')
                 to_predict[record.id] = seq_hash, record
                 if len(to_predict) == batch_size:
                     yield to_predict
