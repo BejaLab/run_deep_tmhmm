@@ -17,6 +17,26 @@ from contextlib import contextmanager
 import subprocess
 import re
 
+# --- Functions to handle GPUs
+
+def default_gpus():
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is not None:
+        if cuda_visible_devices.strip() in ("", "-1"):
+            return []
+        return [x.strip() for x in cuda_visible_devices.split(",")]
+    import torch
+    num_gpus = torch.cuda.device_count()
+    return [str(i) for i in range(num_gpus)]
+
+# --- Constants
+
+DEF_GPUS = default_gpus()
+DEF_CPUS = 1
+DEF_WORKERS = 1
+DEF_SEEDS = [123]
+DEF_BATCH = 100
+
 # --- Helper Functions ---
 
 @contextmanager
@@ -131,7 +151,7 @@ def run_gpu_worker(batch, gpu, cpus, data_path, torch_path, dt_path, log):
         if "PYTHONPATH" in env:
             pythonpath.add(env["PYTHONPATH"])
         env["PYTHONPATH"] = os.pathsep.join(pythonpath)
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu) if gpu is not None else ''
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         env["TORCH_HOME"] = str(torch_path)
         cmd = [ "python", "predict.py", "--fasta", fasta_path.name, "--output-dir", output_path.name ]
         subprocess.run(cmd, env = env, check = True, cwd = tmp_path, stdout = log, stderr = log)
@@ -164,6 +184,8 @@ def launch_run(input_file, output_file, batch_size, data_dir, dt_dir, log_file, 
     data_path, torch_path, db_path = data_paths(data_dir)
     dt_path = Path(dt_dir)
 
+    if not gpus:
+        raise ValueError("No GPUs allocated")
     if cpus <= 0:
         raise ValueError(f"Specify a positive number of CPUs")
     if workers <= 0:
@@ -271,17 +293,18 @@ def run_cli():
     parser = argparse.ArgumentParser(description = "DeepTMHMM wrapper: run the inference")
     def set_of_int(arg):
         return set(int(x) for x in arg.split(',')) if arg != '' else []
-
-    BATCH_SIZE = 100
+    def list_of_str_arg(arg):
+        return [x.strip() for x in arg.split(',')]
+    
 
     parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
     parser.add_argument("-i", "--input", required = True, help = "Path to input sequences")
     parser.add_argument("-o", "--output", required = True, help = "Output file")
     parser.add_argument("-E", "--deep-tmhmm", required = True, help = "DeepTMHMM executable directory (from https://dtu.biolib.com/DeepTMHMM)")
-    parser.add_argument("-b", "--batch", type = int, default = BATCH_SIZE, help = f"Batch size (default: {BATCH_SIZE})")
-    parser.add_argument("-g", "--gpus", type = set_of_int, default = [0], help = "Comma-separated list of indices of available GPUs or empty (default: 0 [first GPU])")
-    parser.add_argument("-c", "--cpus", type = int, default = 1, help = "Total number of CPUs to use (default: 1)")
-    parser.add_argument("-w", "--workers", type = int, default = 1, help = "Total number of parallel workers to spawn (default: 1)")
+    parser.add_argument("-b", "--batch", type = int, default = DEF_BATCH, help = f"Batch size [{DEF_BATCH}]")
+    parser.add_argument("-g", "--gpus", type = list_of_str_arg, default = DEF_GPUS, help=f"GPUs to use [{','.join(DEF_GPUS)}]")
+    parser.add_argument("-c", "--cpus", type = int, default = DEF_CPUS, help = f"Total number of CPUs to use [{DEF_CPUS}]")
+    parser.add_argument("-w", "--workers", type = int, default = DEF_WORKERS, help = f"Total number of parallel workers to spawn [{DEF_WORKERS}]")
     parser.add_argument("-k", "--keep-case", action = 'store_true', help = "Do not change the case of the sequences")
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
     args = parser.parse_args()
